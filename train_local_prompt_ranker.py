@@ -1,8 +1,5 @@
-# train_local_prompt_ranker_optimized.py
-# 修复 I/O 瓶颈、优化答案匹配、增强负采样
-
+# train_ranker_v3_final.py
 import os
-import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,486 +8,336 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 import random
-import json
-import matplotlib.pyplot as plt
-from rank_bm25 import BM25Okapi
 import argparse
 import re
 import string
+import hashlib
+import sqlite3
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer, util
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# ==================== 参数配置 ====================
-parser = argparse.ArgumentParser(description="BM25 + PPL Pairwise Ranker for TriviaQA (Optimized)")
-parser.add_argument('--train_file', type=str, required=True, help="训练集 TSV 文件路径")
-parser.add_argument('--dev_file', type=str, required=True, help="验证集 TSV 文件路径")
-parser.add_argument('--cache_file', type=str, default='ppl_cache.jsonl', help="PPL 特征缓存文件")
-parser.add_argument('--hf_model_path', type=str, default='gpt2', help="HuggingFace 语言模型路径")
+# ================= 配置 =================
+REAL_DATA_PATH = r"D:\py_code\paper\KATEGPT3-main\KATEGPT3-main\inference\dataset\trivia_qa_train_78785_dev_full_train.tsv"
+SAVE_DIR = "./processed_data_v3"
+EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
+GPT2_MODEL_NAME = 'gpt2'
+DB_PATH = "features_cache_v3.db"
+
+# ================= 参数 =================
+parser = argparse.ArgumentParser()
+parser.add_argument('--train_file', type=str, default=REAL_DATA_PATH)
 parser.add_argument('--epochs', type=int, default=5)
-parser.add_argument('--max_length', type=int, default=512)
-parser.add_argument('--k_candidates', type=int, default=60, help="BM25召回的候选数量")
-parser.add_argument('--neg_ratio', type=int, default=5, help="每个正样本配对的负样本数量")
-parser.add_argument('--train_nrows', type=int, default=None, help="训练集读取行数")
-parser.add_argument('--dev_nrows', type=int, default=None, help="验证集读取行数")
+parser.add_argument('--batch_size', type=int, default=64)
 parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--batch_size', type=int, default=32)
-parser.add_argument('--ppl_batch_size', type=int, default=32, help="PPL 计算批量大小")
-parser.add_argument('--save_model_dir', type=str, default='./saved_models')
+parser.add_argument('--k_candidates', type=int, default=50) # 扩大候选池
+parser.add_argument('--neg_ratio', type=int, default=5)
 args = parser.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
 
-# ==================== 1. 标准化与匹配工具 ====================
+# ================= 工具函数 =================
 def normalize_answer(s):
-    """标准的 TriviaQA/SQuAD 答案标准化"""
-    def remove_articles(text):
-        return re.sub(r'\b(a|an|the)\b', ' ', text)
-
-    def white_space_fix(text):
-        return ' '.join(text.split())
-
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return ''.join(ch for ch in text if ch not in exclude)
-
-    def lower(text):
-        return text.lower()
-
+    def remove_articles(text): return re.sub(r'\b(a|an|the)\b', ' ', text)
+    def white_space_fix(text): return ' '.join(text.split())
+    def remove_punc(text): return ''.join(ch for ch in text if ch not in string.punctuation)
+    def lower(text): return text.lower()
     return white_space_fix(remove_articles(remove_punc(lower(str(s)))))
 
-def exact_match(pred, gold):
-    return normalize_answer(pred) == normalize_answer(gold)
+def is_positive_sample(cand_ans, gold_ans):
+    """[修复 #1] 双向包含或相等"""
+    nc = normalize_answer(cand_ans)
+    ng = normalize_answer(gold_ans)
+    if not nc or not ng: return False
+    return (nc == ng) or (nc in ng) or (ng in nc)
 
-def check_containment(cand_ans, gold_ans):
-    """检查候选答案是否包含金标答案（经过标准化）"""
-    norm_cand = normalize_answer(cand_ans)
-    norm_gold = normalize_answer(gold_ans)
-    if not norm_gold: return False
-    return norm_gold in norm_cand # 允许候选答案较长，包含正确答案
+def get_md5(text):
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
 
-# ==================== 2. 优化的 FeatureCache ====================
-class FeatureCache:
-    def __init__(self, cache_path):
-        self.cache_path = cache_path
-        self.data = {}
-        self.write_buffer = []
-        self.buffer_size = 500  # 缓冲区大小，减少IO次数
-
-        if os.path.exists(cache_path):
-            print(f"📦 加载 PPL 缓存文件: {cache_path}")
-            try:
-                with open(cache_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        if line.strip():
-                            item = json.loads(line)
-                            # 使用 tuple 作为 key
-                            key = (item['query'], item['cand_q'], item['cand_a'])
-                            self.data[key] = item['ppl']
-                print(f"✅ 已加载 {len(self.data)} 条缓存记录")
-            except Exception as e:
-                print(f"⚠️ 缓存文件读取错误: {e}")
-
-    def get(self, query, cand_q, cand_a):
-        return self.data.get((query, cand_q, cand_a))
-
-    def add_to_buffer(self, query, cand_q, cand_a, ppl):
-        key = (query, cand_q, cand_a)
-        if key not in self.data:
-            self.data[key] = ppl
-            self.write_buffer.append({'query': query, 'cand_q': cand_q, 'cand_a': cand_a, 'ppl': ppl})
-        
-        if len(self.write_buffer) >= self.buffer_size:
-            self.flush()
-
-    def flush(self):
-        if not self.write_buffer:
-            return
-        with open(self.cache_path, 'a', encoding='utf-8') as f:
-            for item in self.write_buffer:
-                json.dump(item, f)
-                f.write('\n')
-        self.write_buffer = []
-
-# ==================== 3. 语言模型加载 ====================
-print(f"🤖 正在加载语言模型: {args.hf_model_path} ...")
-try:
-    tokenizer = AutoTokenizer.from_pretrained(args.hf_model_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    hf_model = AutoModelForCausalLM.from_pretrained(args.hf_model_path,torch_dtype=torch.float16).to(device)
-    hf_model.eval()
-except Exception as e:
-    print(f"❌ 模型加载失败: {e}")
-    sys.exit(1)
-
-# ==================== 4. 核心计算函数 ====================
-def compute_ppl_batch(prompts: list[str]) -> list[float]:
-    if not prompts:
-        return []
-
-    # 批处理编码
-    inputs = tokenizer(
-        prompts,
-        return_tensors="pt",
-        truncation=True,
-        max_length=args.max_length,
-        padding=True,
-    ).to(device)
-
-    with torch.no_grad():
-        outputs = hf_model(**inputs, labels=inputs["input_ids"])
-
-    # Shift logits and labels for causal LM loss
-    shift_logits = outputs.logits[..., :-1, :].contiguous()
-    shift_labels = inputs["input_ids"][..., 1:].contiguous()
+def smart_read_csv(file_path):
+    print(f"📖 读取文件: {file_path}")
+    try:
+        df = pd.read_csv(file_path, sep='\t', quoting=3, on_bad_lines='skip').fillna("")
+        if len(df.columns) < 2: df = pd.read_csv(file_path, sep=',', quoting=3, on_bad_lines='skip').fillna("")
+    except:
+        df = pd.read_csv(file_path, sep=None, engine='python', quoting=3, on_bad_lines='skip').fillna("")
     
-    loss_fct = nn.CrossEntropyLoss(reduction='none')
-    per_token_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-    per_token_loss = per_token_loss.view(shift_labels.size())
+    col_map = {}
+    for c in df.columns:
+        if str(c).lower().strip() in ['q', 'question']: col_map[c] = 'q'
+        if str(c).lower().strip() in ['a', 'answer']: col_map[c] = 'a'
+    df.rename(columns=col_map, inplace=True)
+    if 'q' not in df.columns: df['q'] = df.iloc[:,0]
+    if 'a' not in df.columns: df['a'] = df.iloc[:,1]
+    return df
 
-    # 计算有效长度 (忽略 padding)
-    lengths = (shift_labels != tokenizer.pad_token_id).sum(dim=1).float()
-    # 修复 ZeroDivisionError: 强制最小长度为 1.0
-    lengths = torch.clamp(lengths, min=1.0)
-
-    seq_loss = per_token_loss.sum(dim=1) / lengths
-    return torch.exp(seq_loss).cpu().numpy().tolist()
-
-def scale_features(ppl_val: float, bm25_score: float):
-    # Log scale PPL because it can be very large
-    # BM25 is usually 10-40 range
-    return [np.log1p(ppl_val) / 5.0, bm25_score / 20.0]
-
-# ==================== 5. 数据集构建 ====================
-class RankingDataset(Dataset):
-    def __init__(self, query_df, corpus_df, bm25_obj, cache_manager, desc):
-        self.samples = []
-        
-        # 预先处理 corpus 数据以加快访问
-        corpus_records = corpus_df.to_dict('records')
-        
-        for idx in tqdm(range(len(query_df)), desc=desc):
-            row = query_df.iloc[idx]
-            query_text = str(row['q']).strip()
-            gold_ans = str(row['a']).strip()
-
-            if not query_text or not gold_ans:
-                continue
-
-            # 1. BM25 粗排检索
-            scores = bm25_obj.get_scores(query_text.lower().split())
-            top_idx = np.argsort(scores)[-args.k_candidates:]
-
-            candidates = []
-            for c_idx in top_idx:
-                c_row = corpus_records[c_idx]
-                c_q = str(c_row['q']).strip()
-                c_a = str(c_row['a']).strip()
-                candidates.append({
-                    'c_q': c_q,
-                    'c_a': c_a,
-                    'score': float(scores[c_idx])
-                })
-
-            # 2. 准备 PPL 计算任务
-            prompts_to_compute = []
-            compute_indices = [] # 记录需要计算的候选下标
-            final_ppls = [None] * len(candidates)
-
-            for i, cand in enumerate(candidates):
-                cached = cache_manager.get(query_text, cand['c_q'], cand['c_a'])
-                if cached is not None:
-                    final_ppls[i] = cached
-                else:
-                    # 构造 Prompt: Q: .. A: .. \n Q: .. A:
-                    prompt = f"Q: {cand['c_q']} A: {cand['c_a']}\nQ: {query_text} A:"
-                    prompts_to_compute.append(prompt)
-                    compute_indices.append(i)
-
-            # 3. 批量计算缺失的 PPL
-            if prompts_to_compute:
-                new_ppls = []
-                for start in range(0, len(prompts_to_compute), args.ppl_batch_size):
-                    batch = prompts_to_compute[start : start + args.ppl_batch_size]
-                    batch_res = compute_ppl_batch(batch)
-                    new_ppls.extend(batch_res)
-                
-                # 回填并加入缓存
-                for i, idx_in_cand in enumerate(compute_indices):
-                    ppl_val = new_ppls[i]
-                    final_ppls[idx_in_cand] = ppl_val
-                    cand = candidates[idx_in_cand]
-                    cache_manager.add_to_buffer(query_text, cand['c_q'], cand['c_a'], ppl_val)
-
-            # 4. 生成训练对 (Pairwise)
-            pos_feats = []
-            neg_feats = []
-
-            for i, cand in enumerate(candidates):
-                feat = torch.tensor(scale_features(final_ppls[i], cand['score']), dtype=torch.float)
-                
-                # 使用严格的匹配逻辑
-                is_correct = check_containment(cand['c_a'], gold_ans)
-                
-                if is_correct:
-                    pos_feats.append(feat)
-                else:
-                    neg_feats.append(feat)
-
-            # 改进采样策略：1个正样本配对 N 个负样本
-            if pos_feats and neg_feats:
-                for pos_feat in pos_feats:
-                    # 如果负样本不够，就有多少取多少
-                    current_neg_count = min(len(neg_feats), args.neg_ratio)
-                    chosen_negs = random.sample(neg_feats, current_neg_count)
-                    for neg_feat in chosen_negs:
-                        self.samples.append((pos_feat, neg_feat))
-        
-        # 处理完所有数据后，强制刷新缓存写入
-        cache_manager.flush()
-        print(f"✅ {desc} 完成，共生成 {len(self.samples)} 个训练对")
-
-    def __len__(self): return len(self.samples)
-    def __getitem__(self, idx): return self.samples[idx]
-
-# ==================== 6. 模型定义 ====================
-class LocalRanker(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.1), # 防止过拟合
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
-# ==================== 7. 评估逻辑 ====================
-@torch.no_grad()
-def evaluate_ranking_metrics(ranker, query_df, corpus_df, bm25_obj, cache_manager, k=60):
-    ranker.eval()
-    reciprocal_ranks = []
-    hits = {1: 0, 5: 0, 10: 0, 20: 0}
+# ================= PPL 计算 (带缓存) =================
+class PPLEngine:
+    def __init__(self, model_path, db_path):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        if self.tokenizer.pad_token is None: self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16).to(device)
+        self.model.eval()
+        self.conn = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute('CREATE TABLE IF NOT EXISTS ppl (hash TEXT PRIMARY KEY, val REAL)')
+        self.conn.commit()
     
+    def get_ppl_batch(self, prompts, hashes):
+        # 1. 查缓存
+        results = {}
+        missing_indices = []
+        missing_prompts = []
+        
+        # 批量查库
+        if not hashes: return []
+        
+        # SQLite 限制，分批查
+        CHUNK = 900
+        for i in range(0, len(hashes), CHUNK):
+            sub_h = hashes[i:i+CHUNK]
+            p_str = ','.join(['?']*len(sub_h))
+            self.cursor.execute(f"SELECT hash, val FROM ppl WHERE hash IN ({p_str})", sub_h)
+            results.update({r[0]: r[1] for r in self.cursor.fetchall()})
+            
+        final_ppls = []
+        for i, h in enumerate(hashes):
+            if h in results:
+                final_ppls.append(results[h])
+            else:
+                final_ppls.append(None)
+                missing_indices.append(i)
+                missing_prompts.append(prompts[i])
+        
+        # 2. 计算缺失
+        if missing_prompts:
+            # 分批推理
+            BS = 32
+            new_vals = []
+            for j in range(0, len(missing_prompts), BS):
+                batch_p = missing_prompts[j:j+BS]
+                inputs = self.tokenizer(batch_p, return_tensors="pt", truncation=True, max_length=512, padding=True).to(device)
+                with torch.no_grad():
+                    outputs = self.model(**inputs, labels=inputs["input_ids"])
+                
+                # Shift logits
+                shift_logits = outputs.logits[..., :-1, :].contiguous()
+                shift_labels = inputs["input_ids"][..., 1:].contiguous()
+                loss_fct = nn.CrossEntropyLoss(reduction='none')
+                loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                loss = loss.view(shift_labels.size())
+                
+                # Mean per sequence
+                lengths = (shift_labels != self.tokenizer.pad_token_id).sum(dim=1).float().clamp(min=1.0)
+                seq_loss = loss.sum(dim=1) / lengths
+                batch_ppl = torch.exp(seq_loss.clamp(max=15.0)).cpu().numpy().tolist() # max=15防止溢出
+                new_vals.extend(batch_ppl)
+            
+            # 3. 写入缓存并填回
+            rows = []
+            for k, val in enumerate(new_vals):
+                origin_idx = missing_indices[k]
+                final_ppls[origin_idx] = val
+                rows.append((hashes[origin_idx], val))
+            
+            self.cursor.executemany("INSERT OR IGNORE INTO ppl VALUES (?, ?)", rows)
+            self.conn.commit()
+            
+        return final_ppls
+
+    def close(self): self.conn.close()
+
+# ================= 特征处理 =================
+def build_dataset(query_df, corpus_df, bm25, sbert, ppl_engine, name):
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    save_path = os.path.join(SAVE_DIR, f"{name}_v3.pt")
+    
+    if os.path.exists(save_path):
+        print(f"📦 发现缓存 {name}, 直接加载...")
+        return torch.load(save_path)
+
+    print(f"⚙️ 开始处理 {name} (3-Feature Mode)...")
+    
+    # 1. 预计算 Corpus Embedding
+    print("   计算 Corpus Embeddings...")
+    corpus_qs = corpus_df['q'].tolist()
+    corpus_embs = sbert.encode(corpus_qs, convert_to_tensor=True, show_progress_bar=True, batch_size=128)
+    
+    # 2. 计算 Query Embedding
+    print("   计算 Query Embeddings...")
+    q_qs = query_df['q'].tolist()
+    q_embs = sbert.encode(q_qs, convert_to_tensor=True, show_progress_bar=True, batch_size=128)
+    
+    samples = [] # (pos, neg)
     corpus_records = corpus_df.to_dict('records')
-
-    for idx in tqdm(range(len(query_df)), desc="📊 评估中", leave=False):
-        row = query_df.iloc[idx]
-        query_text = str(row['q']).strip()
-        gold_ans = str(row['a']).strip()
-
-        scores_bm25 = bm25_obj.get_scores(query_text.lower().split())
-        top_idx = np.argsort(scores_bm25)[-k:]
-
-        features = []
-        is_correct_list = []
-
-        # 收集特征（评估时如果缓存没有PPL，这里简化处理跳过计算，或者你需要在这里也加上PPL计算逻辑）
-        # 假设训练阶段缓存已经覆盖大部分，或者这里接受少部分缺失
-        # 为了严谨，这里简单实现实时计算（单条较慢，但评估集通常较小）
+    
+    eval_data = [] # 用于 MRR 评估: List of {q_id, pos_scores, neg_scores}
+    
+    for i in tqdm(range(len(query_df)), desc="Building Pairs"):
+        q_text = str(q_qs[i])
+        gold_ans = str(query_df.iloc[i]['a'])
+        q_emb = q_embs[i]
         
+        # A. BM25 Retrieve
+        scores = bm25.get_scores(q_text.lower().split())
+        top_idx = np.argsort(scores)[-args.k_candidates:]
+        
+        # 准备批量计算 PPL
+        candidates = [] # list of dict
         prompts = []
-        cand_indices = []
+        hashes = []
         
-        temp_candidates = []
-
-        for c_idx in top_idx:
+        max_bm25 = max(scores[top_idx]) + 1e-6 # 动态归一化
+        
+        # 提取候选信息
+        cand_indices = top_idx.tolist()
+        cand_embs_batch = corpus_embs[cand_indices]
+        cos_sims = util.cos_sim(q_emb, cand_embs_batch)[0].cpu().numpy()
+        
+        temp_cands = []
+        
+        for k, c_idx in enumerate(top_idx):
             c_row = corpus_records[c_idx]
             c_q = str(c_row['q']).strip()
+            # [修复 #2] 在 dev 检索时，如果碰巧检索到自己（虽然理论上 split 了不会，但以防万一），skip
+            if normalize_answer(c_q) == normalize_answer(q_text): continue
+            
             c_a = str(c_row['a']).strip()
             
-            ppl = cache_manager.get(query_text, c_q, c_a)
-            if ppl is None:
-                # 评估时也需要计算PPL
-                prompt = f"Q: {c_q} A: {c_a}\nQ: {query_text} A:"
-                prompts.append(prompt)
-                cand_indices.append(len(temp_candidates))
-                ppl_val = 0.0 # 占位
-            else:
-                ppl_val = ppl
+            prompt = f"Q: {c_q} A: {c_a}\nQ: {q_text} A:"
+            h = get_md5(f"{q_text}_{c_q}_{c_a}")
             
-            temp_candidates.append({
-                'score': float(scores_bm25[c_idx]),
-                'ppl': ppl_val,
-                'is_correct': check_containment(c_a, gold_ans),
-                'c_q': c_q,
-                'c_a': c_a
+            prompts.append(prompt)
+            hashes.append(h)
+            
+            temp_cands.append({
+                'bm25': scores[c_idx] / max_bm25, # Normalized
+                'cos': float(cos_sims[k]),
+                'ans': c_a
             })
-
-        # 补算 PPL
-        if prompts:
-            # 分批算
-            for start in range(0, len(prompts), args.ppl_batch_size):
-                batch = prompts[start:start+args.ppl_batch_size]
-                res = compute_ppl_batch(batch)
-                # 填回
-                for b_idx, r_ppl in enumerate(res):
-                    real_idx = cand_indices[start + b_idx]
-                    temp_candidates[real_idx]['ppl'] = r_ppl
-                    # 存入缓存以备后用
-                    c = temp_candidates[real_idx]
-                    cache_manager.add_to_buffer(query_text, c['c_q'], c['c_a'], r_ppl)
-            cache_manager.flush()
-
-        # 构建 Tensor
-        for cand in temp_candidates:
-            features.append(scale_features(cand['ppl'], cand['score']))
-            is_correct_list.append(cand['is_correct'])
-
-        if not features:
-            reciprocal_ranks.append(0.0)
-            continue
-
-        features_tensor = torch.tensor(features, dtype=torch.float).to(device)
-        model_scores = ranker(features_tensor).cpu().numpy()
+            
+        # B. 计算 PPL
+        ppl_vals = ppl_engine.get_ppl_batch(prompts, hashes)
         
-        # 从高到低排序的索引
-        ranked_order = np.argsort(model_scores)[::-1]
+        # C. 组装特征
+        pos_feats = []
+        neg_feats = []
+        
+        for k, cand in enumerate(temp_cands):
+            ppl = ppl_vals[k]
+            # 特征: [BM25, CosSim, 1/log(PPL)]
+            # PPL 越小越好，所以取倒数或者负对数让其“越大越好”
+            # log(1) = 0, log(100) = 4.6
+            # 使用 1 / (1 + log(PPL))，范围 0-1
+            f_ppl = 1.0 / (1.0 + np.log1p(ppl))
+            
+            feat = [cand['bm25'], cand['cos'], f_ppl]
+            
+            if is_positive_sample(cand['ans'], gold_ans):
+                pos_feats.append(feat)
+            else:
+                neg_feats.append(feat)
+        
+        # D. 生成 Pair
+        if pos_feats and neg_feats:
+            # 训练集生成 Pair
+            if "train" in name:
+                for pf in pos_feats:
+                    negs = random.sample(neg_feats, min(len(neg_feats), args.neg_ratio))
+                    for nf in negs:
+                        samples.append((pf, nf))
+            else:
+                # 验证集保留完整列表用于评估 MRR
+                # 这里为了简单 Dataset 格式，还是存 Pair，但只存一个代表
+                samples.append((pos_feats[0], neg_feats[0])) 
+    
+    print(f"✅ {name} 生成了 {len(samples)} 对样本")
+    torch.save(samples, save_path)
+    return samples
 
-        # 寻找第一个正确答案的排名
-        best_rank = None
-        for rank, pos_idx in enumerate(ranked_order, 1):
-            if is_correct_list[pos_idx]:
-                best_rank = rank
-                break
+# ================= Ranker 模型 =================
+class RankerV3(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # 3维特征: [BM25, CosSim, PPL_Score]
+        self.net = nn.Sequential(
+            nn.Linear(3, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1)
+        )
+    def forward(self, x): return self.net(x).squeeze(-1)
 
-        if best_rank:
-            reciprocal_ranks.append(1.0 / best_rank)
-            for topn in hits:
-                if best_rank <= topn:
-                    hits[topn] += 1
-        else:
-            reciprocal_ranks.append(0.0)
-
-    total = len(reciprocal_ranks) if reciprocal_ranks else 1
-    mrr_10 = np.mean([rr if rr >= 0.1 else 0.0 for rr in reciprocal_ranks]) # 1/10 = 0.1
-    mrr_60 = np.mean(reciprocal_ranks)
-    recall = {f"Recall@{topn}": count / total for topn, count in hits.items()}
-
-    return {
-        "MRR@10": mrr_10,
-        "MRR@60": mrr_60,
-        **recall
-    }
-
-# ==================== 8. 主程序 ====================
+# ================= Main =================
 def main():
-    cache_manager = FeatureCache(args.cache_file)
-
-    print("📂 读取数据文件...")
-    # 注意：quoting=3 用于处理可能的引号问题
-    train_df = pd.read_csv(args.train_file, sep='\t', nrows=args.train_nrows, quoting=3, on_bad_lines='skip').fillna("")
-    dev_df   = pd.read_csv(args.dev_file,   sep='\t', nrows=args.dev_nrows,   quoting=3, on_bad_lines='skip').fillna("")
+    # 1. 加载全量数据并切分
+    full_df = smart_read_csv(args.train_file)
     
-    print(f"   Train Size: {len(train_df)}")
-    print(f"   Dev Size:   {len(dev_df)}")
-
-    print("🔍 构建 BM25 索引...")
-    # 仅使用 Training Set 构建索引语料库
-    bm25 = BM25Okapi([str(q).lower().split() for q in train_df['q']])
-
-    print("🛠️ 构造训练集...")
-    train_ds = RankingDataset(train_df, train_df, bm25, cache_manager, desc="训练集处理")
+    # [修复 #2] 严格切分：最后 10% 做 Dev，剩下做 Train Corpus
+    split_idx = int(len(full_df) * 0.9)
+    train_corpus = full_df.iloc[:split_idx].reset_index(drop=True) # 检索库
+    dev_query_df = full_df.iloc[split_idx:].reset_index(drop=True) # 验证集的 Query
     
-    # 验证集 Dataset 仅用于 loss 计算，Metric 评估单独跑
-    print("🛠️ 构造验证集 (用于 Loss)...")
-    val_ds   = RankingDataset(dev_df, train_df, bm25, cache_manager, desc="验证集处理")
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
-
-    ranker = LocalRanker().to(device)
+    print(f"📊 数据集切分: Train Corpus={len(train_corpus)}, Dev Query={len(dev_query_df)}")
+    
+    # 2. 准备资源
+    print("构建 BM25 (基于 Train Corpus)...")
+    bm25 = BM25Okapi([str(t).lower().split() for t in train_corpus['q']])
+    
+    print(f"加载 SBERT: {EMBEDDING_MODEL_NAME}...")
+    sbert = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
+    
+    print(f"加载 GPT-2 PPL 引擎...")
+    ppl_engine = PPLEngine(GPT2_MODEL_NAME, DB_PATH)
+    
+    # 3. 生成数据 (注意：Dev 也是在 Train Corpus 里搜)
+    train_data = build_dataset(train_corpus, train_corpus, bm25, sbert, ppl_engine, "train")
+    dev_data = build_dataset(dev_query_df, train_corpus, bm25, sbert, ppl_engine, "dev")
+    
+    ppl_engine.close()
+    
+    # 4. 训练
+    class MyDS(Dataset):
+        def __init__(self, d): self.d = d
+        def __len__(self): return len(self.d)
+        def __getitem__(self, i): 
+            return torch.tensor(self.d[i][0], dtype=torch.float), torch.tensor(self.d[i][1], dtype=torch.float)
+            
+    train_loader = DataLoader(MyDS(train_data), batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(MyDS(dev_data), batch_size=args.batch_size, shuffle=False)
+    
+    ranker = RankerV3().to(device)
     optimizer = optim.Adam(ranker.parameters(), lr=args.lr)
-    criterion = nn.MarginRankingLoss(margin=1.0)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=1, verbose=True)
-
-    best_mrr10 = 0.0
-    train_losses, val_losses = [], []
-    mrr10_history = []
-
-    os.makedirs(args.save_model_dir, exist_ok=True)
-
-    print("\n🚀 开始训练...")
+    criterion = nn.MarginRankingLoss(margin=0.1)
+    
+    print("🔥 开始训练 V3 Ranker...")
     for epoch in range(args.epochs):
         ranker.train()
-        total_loss = 0.0
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
+        total_loss = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         for pos, neg in pbar:
             pos, neg = pos.to(device), neg.to(device)
             optimizer.zero_grad()
-            
-            score_pos = ranker(pos)
-            score_neg = ranker(neg)
-            
-            # Label=1 means pos should be higher than neg
-            target = torch.ones_like(score_pos)
-            loss = criterion(score_pos, score_neg, target)
-            
+            sp, sn = ranker(pos), ranker(neg)
+            loss = criterion(sp, sn, torch.ones_like(sp))
             loss.backward()
             optimizer.step()
-            
             total_loss += loss.item()
             pbar.set_postfix({'loss': f"{loss.item():.4f}"})
-
-        avg_train_loss = total_loss / len(train_loader) if len(train_loader) > 0 else 0
-        train_losses.append(avg_train_loss)
-
-        # 验证 Loss
+            
+        # 简单验证
         ranker.eval()
-        val_loss = 0.0
+        correct = 0
+        total = 0
         with torch.no_grad():
             for pos, neg in val_loader:
                 pos, neg = pos.to(device), neg.to(device)
-                score_pos = ranker(pos)
-                score_neg = ranker(neg)
-                loss = criterion(score_pos, score_neg, torch.ones_like(score_pos))
-                val_loss += loss.item()
-        avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
-        val_losses.append(avg_val_loss)
-
-        # 验证 Ranking Metrics
-        metrics = evaluate_ranking_metrics(ranker, dev_df, train_df, bm25, cache_manager, k=args.k_candidates)
-        mrr10 = metrics["MRR@10"]
-        mrr10_history.append(mrr10)
-
-        print(f"\n📊 Epoch {epoch+1} Summary:")
-        print(f"   Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-        print(f"   MRR@10: {mrr10:.4f} (Best: {max(best_mrr10, mrr10):.4f})")
-        print(f"   R@1: {metrics['Recall@1']:.4f} | R@5: {metrics['Recall@5']:.4f}")
-
-        if mrr10 > best_mrr10:
-            best_mrr10 = mrr10
-            save_path = os.path.join(args.save_model_dir, f"best_ranker_mrr{mrr10:.3f}.pth")
-            torch.save(ranker.state_dict(), save_path)
-            print(f"💾 模型已保存: {save_path}")
-
-        scheduler.step(mrr10)
-
-    # 绘制曲线
-    try:
-        fig, ax1 = plt.subplots(figsize=(10, 5))
-        ax1.plot(train_losses, label="Train Loss", color="tab:blue")
-        ax1.plot(val_losses, label="Val Loss", color="tab:orange")
-        ax1.set_xlabel("Epoch")
-        ax1.set_ylabel("Loss")
-        ax1.legend(loc="upper left")
+                correct += (ranker(pos) > ranker(neg)).sum().item()
+                total += pos.size(0)
+        print(f"Epoch {epoch+1} Val Pair Acc: {correct/total:.4f}")
         
-        ax2 = ax1.twinx()
-        ax2.plot(mrr10_history, label="MRR@10", color="tab:green", marker='o', linestyle='--')
-        ax2.set_ylabel("MRR@10")
-        ax2.legend(loc="upper right")
-        
-        plt.title("Training Loss & MRR@10")
-        plt.tight_layout()
-        plt.savefig(os.path.join(args.save_model_dir, "training_curve.png"))
-        print("📈 训练曲线已保存。")
-    except Exception as e:
-        print(f"绘图失败: {e}")
+    torch.save(ranker.state_dict(), "ranker_v3.pth")
+    print("✅ 模型保存为 ranker_v3.pth")
 
 if __name__ == "__main__":
     main()
